@@ -14,7 +14,8 @@ env = os.environ.copy()
 env["PATH"] = "C:/msys64/mingw64/bin;" + env.get("PATH", "")
 
 r = subprocess.run(
-    [GCC, "-O2", "-Wall", "lab-agent.c", "-o", "lab-agent.exe", "-lws2_32"],
+    [GCC, "-O2", "-Wall", "lab-agent.c", "-o", "lab-agent.exe",
+     "-lws2_32", "-lsecur32", "-ladvapi32", "-lcrypt32"],
     cwd=HERE, capture_output=True, text=True, env=env,
 )
 print(r.stderr or "(no warnings)")

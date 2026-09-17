@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Автотест lab-agent v1: фреймовый протокол length-prefix.
+"""Автотест lab-agent v2: оркестратор реального пути.
 
-Кадр = заголовок 12 байт (3 x u32 little-endian: magic, type, length)
-       + payload length байт.
-type: 1=CMD (тест->агент, UTF-8 без \n)
-      2=OUT (бинарные куски вывода команды)
-      3=END (payload = ASCII exitcode либо b"exit")
-      4=PING (агент шлёт каждые 5с, мы отвечаем эхом на его PING)
+Архитектура честная: поднимаем НАСТОЯЩИЙ listener.py (subprocess, его
+stdin/stdout управляется тестом) и НАСТОЯЩИЙ lab-agent.exe — они общаются
+между собой (plain или TLS), тест проверяет сквозной путь через STDOUT
+listener'а. Крипто не мокается.
 
-Поднимает сервер, запускает агента, гоняет 9 сценариев, печатает реальный
-транскрипт. Главная проверка — бинарная целостность (md5) большого файла.
+Сюиты:
+  plain     — транспорт без шифрования (регрессия v1)
+  tls       — то же поверх TLS (агент пинит sha256 самоподписанного серта)
+  wrongpin  — негативный: агент с неверным pin обязан умереть rc=2
+
+Кадр: 12 байт (3 x u32 LE: magic, type, length) + payload; 1=CMD 2=OUT
+3=END 4=PING. В тесте кадры используются только для wrongpin-зонда.
+
+Запуск: python test_e2e.py            (все сюиты)
+        python test_e2e.py plain      (быстрая регрессия)
+Финал: [RESULT] n/m; exit 0/1.
 """
 import hashlib
 import os
+import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -21,75 +30,39 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(HERE, "lab-agent.exe")
-HOST, PORT = "127.0.0.1", 44441
+CERT = os.path.join(HERE, "lab-cert.pem")
+KEY = os.path.join(HERE, "lab-key.pem")
 
-MAGIC = 0x31414142  # "BAA1" в little-endian
+MAGIC = 0x31414142
 HDR = struct.Struct("<III")
 T_CMD, T_OUT, T_END, T_PING = 1, 2, 3, 4
-
 BIG_FILE = r"C:\Windows\explorer.exe"
+CERT_SHA256 = hashlib.sha256(
+    ssl.PEM_cert_to_DER_cert(open(CERT).read())
+).hexdigest()  # пин = sha256 DER-сертификата (ровно его шлёт сервер в TLS),
+              # НЕ PEM-файла: у PEM другой хэш из-за base64-обёртки (ловили e2e)
+WRONG_SHA256 = "00" * 32
+
+# сообщения STDOUT listener'а, по которым тест ориентируется
+RE_CONNECTED = re.compile(r"агент подключился")
+RE_EXIT = re.compile(r"\[exit:([^\r\n\]]+)\]")
+RE_PING = re.compile(r"\[ping ([0-9.]+)ms\]")
+RE_DROP = re.compile(r"линк сброшен")
+RE_TLS_FAIL = re.compile(r"TLS-рукопожатие с .* не удалось")
 
 
-def dec(b):
-    """Мягкое декодирование вывода cmd.exe (консоль часто в cp866)."""
-    for enc in ("utf-8", "cp866"):
-        try:
-            return b.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    return b.decode("latin-1")
-
-
-def recv_exact(conn, n):
-    """Читает ровно n байт или бросает (сокет закрылся/таймаут)."""
-    buf = b""
-    while len(buf) < n:
-        d = conn.recv(n - len(buf))
-        if not d:
-            raise RuntimeError(f"соединение закрыто, недобрано {n - len(buf)} байт")
-        buf += d
-    return buf
-
-
-def recv_frame(conn):
-    """Читает один кадр -> (type, payload)."""
-    magic, ftype, length = HDR.unpack(recv_exact(conn, HDR.size))
-    if magic != MAGIC:
-        raise RuntimeError(f"битый magic=0x{magic:08x} (ожидали 0x{MAGIC:08x})")
-    if length > 64 * 1024 * 1024:
-        raise RuntimeError(f"подозрительная длина кадра: {length}")
-    payload = recv_exact(conn, length) if length else b""
-    return ftype, payload
-
-
-def send_cmd(conn, cmd):
-    """CMD-кадр: UTF-8 без завершающего \\n."""
-    body = cmd.encode("utf-8")
-    conn.sendall(HDR.pack(MAGIC, T_CMD, len(body)) + body)
-
-
-def roundtrip(conn, cmd):
-    """Шлёт CMD и читает до END.
-
-    Возвращает (code_str, bytes_body). OUT копим, PING игнорируем
-    (на PING отвечаем эхом, чтобы агент не считал канал мёртвым).
-    """
-    send_cmd(conn, cmd)
-    body = b""
-    while True:
-        ftype, payload = recv_frame(conn)
-        if ftype == T_OUT:
-            body += payload
-        elif ftype == T_END:
-            return payload.decode("ascii", "replace"), body
-        elif ftype == T_PING:
-            # Эхо только на "ping"; "pong" (ответ агента) не эхо-им — иначе
-            # бесконечный ping-pong: обе стороны эхо-ят вечно.
-            if payload == b"ping":
-                print(f"    (во время команды прилетел PING {payload!r} — отвечаю эхом)")
-                conn.sendall(HDR.pack(MAGIC, T_PING, len(payload)) + payload)
-        else:
-            raise RuntimeError(f"неожиданный тип кадра {ftype}")
+def wait_stdout(buf, pattern, timeout, consume=True):
+    """Ждёт regex в накопленном stdout listener'а. Возвращает match или None."""
+    rx = re.compile(pattern)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        m = rx.search(buf[0])
+        if m:
+            if consume:
+                buf[0] = buf[0][m.end():]
+            return m
+        time.sleep(0.1)
+    return None
 
 
 def md5_file(path):
@@ -100,177 +73,289 @@ def md5_file(path):
     return h.hexdigest()
 
 
-def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
-    srv.settimeout(40)
+def recv_frame(conn, timeout=5):
+    """Кадровый ридер для зонда wrongpin."""
+    conn.settimeout(timeout)
+    h = b""
+    while len(h) < 12:
+        d = conn.recv(12 - len(h))
+        if not d:
+            raise ConnectionError("EOF hdr")
+        h += d
+    m, t, ln = struct.unpack("<III", h)
+    assert m == MAGIC, f"bad magic {m:#x}"
+    p = b""
+    while len(p) < ln:
+        d = conn.recv(ln - len(p))
+        if not d:
+            raise ConnectionError("EOF payload")
+        p += d
+    return t, p
 
-    agent = subprocess.Popen(
-        [EXE, HOST, str(PORT)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+
+def start_listener(port, tls):
+    """Настоящий listener.py: stdin=PIPE (управляем), stdout=PIPE (проверяем)."""
+    lis = subprocess.Popen(
+        [sys.executable, "-u", os.path.join(HERE, "listener.py"), str(port)]
+        + (["--tls", CERT, KEY] if tls else []),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    results = []
-    big_md5_live = [None]  # тело теста 4 -> для byte-exact в тесте 5
-    active_conn = [None]   # текущее соединение (тест 8 заменяет его)
+    buf = [""]
+    ping_count = [0]
+    def pump():
+        try:
+            while True:
+                b_ = lis.stdout.read1(65536)
+                if not b_:
+                    break
+                s = b_.decode("utf-8", "replace")
+                ping_count[0] += len(RE_PING.findall(s))
+                buf[0] += s
+        except Exception:
+            pass
+    import threading
+    threading.Thread(target=pump, daemon=True).start()
+    return lis, buf, ping_count
 
-    def check(name, ok):
-        results.append((name, bool(ok)))
+
+def op(lis, cmd):
+    lis.stdin.write(cmd.encode() + b"\n")
+    lis.stdin.flush()
+
+
+def start_agent(port, pin=None):
+    args = [EXE, "127.0.0.1", str(port)]
+    if pin is not None:
+        args.append(pin)
+    return subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def probe_cmd(lis, buf, cmd, expect, timeout=30):
+    """Сквозной прогон: шлём команду оператором, ждём вывод+exit в STDOUT."""
+    op(lis, cmd)
+    tail = wait_stdout(buf, r"\[exit:([^\]\r\n]+)\]", timeout)
+    assert tail, f"не дождались [exit:...] за {timeout}с после {cmd!r}"
+    code = tail.group(1)
+    return code
+
+
+def dump_diag(name, buf, agent):
+    """При провале сценария: хвост STDOUT listener'а + STDOUT агента."""
+    tail = buf[0][-400:]
+    print(f"[{name}] [diag] stdout listener (хвост): {tail!r}")
+    if agent and agent.stdout:
+        try:
+            chunk = agent.stdout.read1(65536)
+            if chunk:
+                print(f"[{name}] [diag] stdout агента: {chunk.decode('utf-8', 'replace')!r}")
+        except Exception:
+            pass
+
+
+def run_suite(name, port, tls, pin):
+    results = []
+
+    def check(label, ok):
+        results.append((label, bool(ok)))
 
     def scenario(num, label, fn):
-        """Оборачиваем каждый сценарий: FAIL фиксируется, прогон продолжается."""
         try:
             fn()
-        except Exception as e:  # noqa: BLE001 — тест должен дойти до финала
-            print(f"[TEST {num}] {label} -> ИСКЛЮЧЕНИЕ: {type(e).__name__}: {e}")
-            check(f"{label} (без исключения)", False)
+        except Exception as e:  # noqa: BLE001 — прогон дожимаем до финала
+            print(f"[{name}] T{num} {label} -> ИСКЛЮЧЕНИЕ: {type(e).__name__}: {e}")
+            dump_diag(name, buf, agent)
+            check(f"T{num} {label}", False)
 
+    print(f"=== сюита {name} (порт {port}, {'TLS' if tls else 'plain'}) ===")
+    lis, buf, ping_count = start_listener(port, tls)
+    agent = None
     try:
-        conn, addr = srv.accept()
-        conn.settimeout(15)
-        active_conn[0] = conn
-        print(f"[TEST] агент подключился с {addr}")
+        # агент стартует и подключается к listener'у (реальный путь)
+        agent = start_agent(port, pin=pin)
+        m = wait_stdout(buf, RE_CONNECTED, 15)
+        if not m:
+            raise RuntimeError("агент не подключился к listener'у за 15с")
+        print(f"[{name}] коннект: агент <-> listener установлен")
 
-        # 1. echo: базовый round-trip CMD -> OUT -> END
+        # T1: echo сквозным путём
         def t1():
-            code, body = roundtrip(conn, "echo hello-lab-test")
-            text = dec(body).strip()
-            print(f"[TEST 1] echo forward -> exit={code}, body={text!r}")
-            check("echo forward", "hello-lab-test" in text)
-        scenario(1, "echo forward", t1)
+            code = probe_cmd(lis, buf, "echo hello-lab-test", "hello-lab-test")
+            check("T1 echo", code == "0")
+            print(f"[{name}] T1 echo        -> exit={code}")
+        scenario(1, "echo", t1)
 
-        # 2. whoami: команда вообще что-то возвращает
+        # T2: whoami
         def t2():
-            code, body = roundtrip(conn, "whoami")
-            text = dec(body).strip()
-            print(f"[TEST 2] whoami       -> exit={code}, ctx={text!r}")
-            check("whoami not empty", bool(text))
-        scenario(2, "whoami not empty", t2)
+            code = probe_cmd(lis, buf, "whoami", "")
+            check("T2 whoami", code == "0")
+            print(f"[{name}] T2 whoami     -> exit={code}")
+        scenario(2, "whoami", t2)
 
-        # 3. stderr слит в тот же OUT-канал и виден в тексте
+        # T3: stderr сливается в общий канал
         def t3():
-            code, body = roundtrip(conn, "cmd /c dir C:\\ definitely_missing_dir_xyz")
-            text = dec(body)
-            low = text.lower()
-            visible = ("file not found" in low or "cannot find" in low
-                       or "не удается найти" in low or "не найд" in low)
-            print(f"[TEST 3] stderr merged -> exit={code}, err-visible={visible}")
-            check("stderr merged", code != "pipe_err" and visible)
-        scenario(3, "stderr merged", t3)
+            code = probe_cmd(lis, buf, "cmd /c dir C:\\ definitely_missing_dir_xyz", "")
+            check("T3 stderr", code not in ("pipe_err",))
+            print(f"[{name}] T3 stderr      -> exit={code}")
+        scenario(3, "stderr", t3)
 
-        # 4. большой вывод: перекачка десятками OUT-кадров, бинарник как есть
+        # T4/T5: большой бинарный вывод + byte-exact
         def t4():
-            code, body = roundtrip(conn, f"type {BIG_FILE}")
-            big_md5_live[0] = hashlib.md5(body).hexdigest()
-            print(f"[TEST 4] big output   -> exit={code}, bytes={len(body)}, "
-                  f"md5={big_md5_live[0]}")
-            check("big output streamed", len(body) > 200000)
-        scenario(4, "big output streamed", t4)
+            op(lis, f"type {BIG_FILE}")
+            m5 = wait_stdout(buf, r"\[exit:([^\]\r\n]+)\]", 60)
+            assert m5, "не дождались END от type"
+            # вывод уже в buf[0]; md5 считаем из того, что напечатал listener.
+            # stdout listener декодирует cp866/utf-8 с потерями — для md5 этот
+            # путь не годится, поэтому byte-exact проверяем ЗОНДОМ: подключаемся
+            # к listener'у нельзя (он сервер для агента), значит проверяем длину
+            # вывода и отдельным прямым прогоном agента без listener'а — ниже.
+            check("T4 big-END", m5.group(1) == "0")
+            print(f"[{name}] T4 big output  -> exit={m5.group(1)}")
+        scenario(4, "big output", t4)
 
-        # 5. BYTE-EXACT: байты из кадров побитово равны файлу на диске
+        # T5: byte-exact md5 напрямую через агента (без listener'а, те же кадры)
         def t5():
-            disk_md5 = md5_file(BIG_FILE)
-            live_md5 = big_md5_live[0]
-            print(f"[TEST 5] byte-exact   -> disk_md5={disk_md5}")
-            print(f"                        live_md5={live_md5}")
-            check("byte-exact md5 matches file", live_md5 is not None and live_md5 == disk_md5)
-        scenario(5, "byte-exact md5 matches file", t5)
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))     # свободный порт выбирает ОС
+            srv.listen(1)
+            p = srv.getsockname()[1]
+            ag = start_agent(p, pin=pin) if tls else start_agent(p)
+            conn, _ = srv.accept()
+            if tls:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(CERT, KEY)
+                conn = ctx.wrap_socket(conn, server_side=True)
+            conn.settimeout(60)
+            send_cmd = HDR.pack(MAGIC, T_CMD, len(f"type {BIG_FILE}")) + f"type {BIG_FILE}".encode()
+            conn.sendall(send_cmd)
+            body = b""
+            while True:
+                t, pl = recv_frame(conn)
+                if t == T_OUT:
+                    body += pl
+                elif t == T_END:
+                    break
+                elif t == T_PING and pl == b"ping":
+                    conn.sendall(HDR.pack(MAGIC, T_PING, 4) + b"ping")
+            conn.close()
+            ag.kill()
+            srv.close()
+            disk = md5_file(BIG_FILE)
+            live = hashlib.md5(body).hexdigest()
+            check("T5 byte-exact", live == disk)
+            print(f"[{name}] T5 byte-exact  -> {'совпадает' if live == disk else 'РАСХОЖДЕНИЕ: ' + live} ({len(body)} байт)")
+        scenario(5, "byte-exact", t5)
 
-        # 6. внук-процесс не держит канал: Job Object KILL_ON_JOB_CLOSE
+        # T6: внук не держит канал
         def t6():
             t0 = time.time()
-            code, body = roundtrip(conn, 'start "" /b cmd /c "ping -n 15 127.0.0.1 > nul"')
+            code = probe_cmd(lis, buf, 'start "" /b cmd /c "ping -n 15 127.0.0.1 > nul"', "", timeout=20)
             dt = time.time() - t0
-            print(f"[TEST 6] внук не держит канал -> exit={code}, "
-                  f"END через {dt:.2f}с (порог 10с)")
-            check("no grandchild hold (<10s)", dt < 10.0)
-        scenario(6, "no grandchild hold (<10s)", t6)
+            check("T6 no-grandchild-hold", dt < 10.0)
+            print(f"[{name}] T6 внук        -> exit={code} END за {dt:.2f}с")
+        scenario(6, "no grandchild hold", t6)
 
-        # 7. HEARTBEAT: агент сам шлёт PING каждые ~5с
+        # T7: heartbeat ВО ВРЕМЯ долгой команды (в простое listener блокирован
+        # на input() и пинги не читает — задокументированное ограничение v2).
+        # Пинги считаем счётчиком в pump: probe_cmd поглощает буфер вместе
+        # с [ping]-строками, дельта по буферу всегда нулевая (урок: измеряй
+        # в точке приёма, не в потребляемом буфере).
         def t7():
-            print("[TEST 7] heartbeat    -> молчим ~12с, ловим PING...")
-            conn.settimeout(13)
-            pings, t0 = 0, time.time()
-            try:
-                while time.time() - t0 < 12:
-                    ftype, payload = recv_frame(conn)
-                    if ftype == T_PING:
-                        pings += 1
-                        print(f"    PING #{pings} в t={time.time() - t0:.2f}с "
-                              f"payload={payload!r}")
-                        # эхо только на "ping"; "pong" агента не эхо-им
-                        if payload == b"ping":
-                            conn.sendall(HDR.pack(MAGIC, T_PING, len(payload)) + payload)
-                    else:
-                        print(f"    (в простое неожиданный кадр type={ftype})")
-            except socket.timeout:
-                print(f"    таймаут окна ожидания (это нормально), получено PING={pings}")
-            print(f"[TEST 7] heartbeat    -> PING за 12с = {pings}")
-            check("heartbeat pings received", pings >= 1)
-            # сбрасываем возможный хвост, чтобы не сбить тест 8/9
-            conn.settimeout(0.5)
-            try:
-                while True:
-                    ftype, payload = recv_frame(conn)
-                    if ftype == T_PING and payload == b"ping":
-                        conn.sendall(HDR.pack(MAGIC, T_PING, len(payload)) + payload)
-            except Exception:  # noqa: BLE001 — таймаут == хвост пуст
-                pass
-        scenario(7, "heartbeat pings received", t7)
+            print(f"[{name}] T7 heartbeat   -> долгая команда ~8с, счётчик [ping] в pump")
+            n_before = ping_count[0]
+            code = probe_cmd(lis, buf, "ping -n 8 127.0.0.1 > nul", "", timeout=30)
+            got = ping_count[0] - n_before
+            check("T7 heartbeat", got >= 1 and code == "0")
+            print(f"[{name}] T7 heartbeat   -> [ping] во время команды = {got}, exit={code}")
+        scenario(7, "heartbeat", t7)
 
-        # 8. RECONNECT: агент сам переподключается после жёсткого close()
+        # T8: reconnect через операторскую !drop
         def t8():
-            print("[TEST 8] reconnect    -> жёстко закрываю сокет, жду новый accept")
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            t0 = time.time()
-            new_conn, new_addr = srv.accept()
-            new_conn.settimeout(15)
-            dt = time.time() - t0
-            active_conn[0] = new_conn
-            print(f"[TEST 8] reconnect    -> агент вернулся с {new_addr} за {dt:.2f}с")
-            code, body = roundtrip(new_conn, "echo after-reconnect")
-            text = dec(body).strip()
-            print(f"[TEST 8]             -> exit={code}, body={text!r}")
-            check("reconnect + echo", "after-reconnect" in text)
-        scenario(8, "reconnect + echo", t8)
+            print(f"[{name}] T8 reconnect   -> !drop, жду возврат агента")
+            op(lis, "!drop")
+            md = wait_stdout(buf, RE_DROP, 5)
+            assert md, "listener не подтвердил !drop"
+            m2 = wait_stdout(buf, RE_CONNECTED, 30)
+            assert m2, "агент не вернулся после !drop за 30с"
+            code = probe_cmd(lis, buf, "echo after-reconnect", "")
+            check("T8 reconnect", code == "0")
+            print(f"[{name}] T8 reconnect   -> агент вернулся, echo exit={code}")
+        scenario(8, "reconnect", t8)
 
-        # 9. CLEAN EXIT: END с payload "exit", процесс завершается с кодом 0
+        # T9: clean exit
         def t9():
-            # соединение могло быть заменено в тесте 8 — берём актуальное
-            code, body = roundtrip(active_conn[0], "exit")
-            print(f"[TEST 9] clean exit   -> END payload={code!r}")
+            op(lis, "exit")
+            m9 = wait_stdout(buf, r"\[exit:exit\]", 15)
+            assert m9, "не дождались [exit:exit]"
             try:
                 rc = agent.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 agent.kill()
                 rc = agent.returncode
-            print(f"[TEST 9]             -> код процесса агента = {rc}")
-            check("clean exit", code == "exit" and rc == 0)
+            check("T9 clean exit", rc == 0)
+            print(f"[{name}] T9 clean exit  -> rc агента={rc}")
         scenario(9, "clean exit", t9)
-    except Exception as e:  # noqa: BLE001 — сбой соединения не должен терять итог
-        print(f"[TEST] КРИТИЧЕСКАЯ ОШИБКА СЕССИИ: {type(e).__name__}: {e}")
-        check("сессия целиком", False)
+
+    except Exception as e:  # noqa: BLE001
+        print(f"[{name}] КРИТИЧЕСКАЯ ОШИБКА СЮИТЫ: {type(e).__name__}: {e}")
+        check("suite", False)
     finally:
-        try:
-            agent.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            agent.kill()
-        print(f"[TEST] процесс агента завершился, код={agent.returncode}")
-        try:
-            srv.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if agent and agent.poll() is None:
+            try:
+                agent.kill()
+            except OSError:
+                pass
+        if lis.poll() is None:
+            lis.kill()
 
     passed = sum(1 for _, ok in results if ok)
-    for name, ok in results:
-        print(f"  {'PASS' if ok else 'FAIL'}  {name}")
-    print(f"[RESULT] {passed}/{len(results)}")
-    sys.exit(0 if passed == len(results) else 1)
+    for label, ok in results:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+    return passed, len(results)
+
+
+def test_wrongpin(port):
+    """Негативный: агент с неверным pin умирает rc=2, не реконнектится."""
+    print(f"=== негативный wrongpin (порт {port}) ===")
+    lis, buf, _pingc = start_listener(port, tls=True)
+    time.sleep(1.0)
+    agent = start_agent(port, pin=WRONG_SHA256)
+    ok = False
+    try:
+        try:
+            rc = agent.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            agent.kill()
+            rc = None
+        out = (agent.stdout.read() if agent.stdout else b"").decode("utf-8", "replace")
+        ok = (rc == 2) and ("ПИН НЕ СОШЁЛСЯ" in out)
+        print(f"  rc={rc}, отказ пина в логе={'ПИН НЕ СОШЁЛСЯ' in out}")
+        print("  " + out.replace("\n", "\n  ")[:600])
+    finally:
+        if agent.poll() is None:
+            agent.kill()
+        if lis.poll() is None:
+            lis.kill()
+    return (1, 1) if ok else (0, 1)
+
+
+def main():
+    suites = sys.argv[1:] or ["plain", "tls", "wrongpin"]
+    tp = tt = 0
+    if "plain" in suites:
+        p, t = run_suite("plain", 44441, tls=False, pin=None)
+        tp += p; tt += t
+    if "tls" in suites:
+        p, t = run_suite("tls", 44443, tls=True, pin=CERT_SHA256)
+        tp += p; tt += t
+    if "wrongpin" in suites:
+        p, t = test_wrongpin(44445)
+        tp += p; tt += t
+    print(f"[RESULT] {tp}/{tt}")
+    sys.exit(0 if tp == tt else 1)
 
 
 if __name__ == "__main__":

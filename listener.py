@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""listener.py — консоль оператора для lab-agent v1 (терминал 1).
+"""listener.py — консоль оператора для lab-agent v2 (терминал 1).
 
-Протокол v1 — length-prefix фреймы (заменил построчный протокол v0):
-    заголовок 12 байт = три u32 little-endian: magic, type, length
-    дальше ровно length байт payload.
+Транспорт: v1 length-prefix кадры; v2 добавляет TLS (--tls CERT KEY).
+    python listener.py                      — plaintext (порт 4444)
+    python listener.py --tls lab-cert.pem lab-key.pem [PORT]
+TLS самоподписанный: системную валидацию отключаем, вместо trust-store
+пиним sha256 серверного сертификата (его печатает агент при подключении).
 
-type: 1=CMD  (оператор->агент, payload = UTF-8 команда БЕЗ \\n)
+Кадр: заголовок 12 байт = три u32 little-endian: magic, type, length,
+дальше ровно length байт payload.
+type: 1=CMD  (оператор->агент, payload = UTF-8 команда без \\n)
       2=OUT  (агент->оператор, куски вывода, бинарные как есть)
       3=END  (агент->оператор, payload = ASCII exitcode либо b"exit")
-      4=PING (heartbeat: агент шлёт каждые 5с, мы отвечаем эхом)
+      4=PING (heartbeat: агент шлёт 'ping' каждые 5с, мы эхо-им;
+              'pong' — терминальный ответ агента, его НЕ эхо-им — урок v1)
 
-Агент переподключается сам, поэтому оператор в цикле accept'ит новые
-соединения и продолжает работу с новым сокетом.
+Агент переподключается сам (backoff), оператор в цикле accept'ит заново.
 Выход из оператора: Ctrl+C. Выход агента: команда exit.
 """
 import socket
+import ssl
 import struct
 import sys
 import time
@@ -22,10 +27,10 @@ import time
 HOST = "127.0.0.1"
 PORT = 4444
 
-MAGIC = 0x31414142  # "BAA1" в little-endian ('BA01' байтами)
+MAGIC = 0x31414142  # на проводе байты 'BAA1'
 T_CMD, T_OUT, T_END, T_PING = 1, 2, 3, 4
 HDR = struct.Struct("<III")  # три u32 little-endian = 12 байт
-MAX_FRAME = 64 * 1024 * 1024  # защита от битого/гигантского заголовка
+MAX_FRAME = 64 * 1024 * 1024
 
 
 def dec(b: bytes) -> str:
@@ -38,7 +43,7 @@ def dec(b: bytes) -> str:
     return b.decode("latin-1")
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def recv_exact(sock, n: int) -> bytes:
     """Читает ровно n байт: recv может вернуть кусок, крутим цикл."""
     buf = b""
     while len(buf) < n:
@@ -49,7 +54,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return buf
 
 
-def recv_frame(sock: socket.socket):
+def recv_frame(sock):
     """Читает один кадр -> (type, payload). Обрыв/magic -> исключение."""
     magic, ftype, length = HDR.unpack(recv_exact(sock, HDR.size))
     if magic != MAGIC:
@@ -60,22 +65,17 @@ def recv_frame(sock: socket.socket):
     return ftype, payload
 
 
-def send_frame(sock: socket.socket, ftype: int, payload: bytes = b""):
-    """Шлёт кадр: заголовок + payload одним куском."""
+def send_frame(sock, ftype: int, payload: bytes = b""):
     sock.sendall(HDR.pack(MAGIC, ftype, len(payload)) + payload)
 
 
-def send_cmd(sock: socket.socket, cmd: str):
+def send_cmd(sock, cmd: str):
     """CMD-кадр: UTF-8 без завершающего \\n."""
     send_frame(sock, T_CMD, cmd.encode("utf-8"))
 
 
-def run_command(sock: socket.socket, cmd: str) -> bool:
-    """Шлёт команду и читает кадры до END.
-
-    OUT печатаем по мере прихода, на PING отвечаем эхом и печатаем
-    однострочное уведомление. Возвращает True, если это был exit.
-    """
+def run_command(sock, cmd: str) -> bool:
+    """Шлёт команду и читает кадры до END. Возвращает True, если это exit."""
     send_cmd(sock, cmd)
     tail = ""  # хвост неполной строки (вывод рвётся между кадрами)
     while True:
@@ -84,7 +84,6 @@ def run_command(sock: socket.socket, cmd: str) -> bool:
             out = tail + dec(payload)
             tail = ""
             if not out.endswith(("\n", "\r")):
-                # строка может продолжиться в следующем кадре — придержим хвост
                 cut = out.rstrip("\r\n")
                 keep = max(cut.rfind("\n"), cut.rfind("\r"))
                 if keep < 0:
@@ -95,17 +94,15 @@ def run_command(sock: socket.socket, cmd: str) -> bool:
             sys.stdout.write(out)
             sys.stdout.flush()
         elif ftype == T_PING:
-            # Эхо только на "ping" (heartbeat-запрос агента). "pong" —
-            # терминальный ответ агента на наше эхо: эхо-ить его нельзя,
-            # иначе бесконечный ping-pong (обе стороны эхо-ят вечно).
+            # Эхо только на "ping". "pong" — терминальный ответ агента:
+            # эхо-ить его нельзя, иначе бесконечный ping-pong (урок v1).
             if payload == b"ping":
                 t0 = time.time()
                 send_frame(sock, T_PING, payload)
                 rtt = (time.time() - t0) * 1000
                 print(f"[ping {rtt:.1f}ms]")
-            # else: b"pong" — просто подтверждение линка, молча
         elif ftype == T_END:
-            if tail:  # печатаем незакрытую строку перед итогом
+            if tail:
                 sys.stdout.write(tail)
                 sys.stdout.flush()
             code = payload.decode("ascii", "replace")
@@ -116,22 +113,59 @@ def run_command(sock: socket.socket, cmd: str) -> bool:
             raise ConnectionError(f"неизвестный тип фрейма {ftype}")
 
 
+def parse_args(argv):
+    tls_cert = tls_key = None
+    port = PORT
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        if args[i] == "--tls":
+            if i + 2 >= len(args):
+                sys.exit("использование: --tls CERT KEY [PORT]")
+            tls_cert, tls_key = args[i + 1], args[i + 2]
+            i += 3
+        elif args[i].isdigit():
+            port = int(args[i])
+            i += 1
+        else:
+            i += 1
+    return tls_cert, tls_key, port
+
+
 def main():
+    tls_cert, tls_key, port = parse_args(sys.argv[1:])
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
+    srv.bind((HOST, port))
     srv.listen(1)
-    print(f"[operator] жду агента на {HOST}:{PORT} ...")
+
+    tls_ctx = None
+    if tls_cert:
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(tls_cert, tls_key)
+        # системную валидацию клиента тут и нет; агент пинит НАШ отпечаток
+        print(f"[operator] TLS-режим: cert={tls_cert} key={tls_key}")
+    print(f"[operator] жду агента на {HOST}:{port} ...")
 
     while True:
-        # ── ждём подключения (переподключения агента приходят сюда же) ──
         try:
             conn, addr = srv.accept()
         except KeyboardInterrupt:
             print("\n[operator] выходим")
             break
-        conn.settimeout(None)
-        print(f"[operator] агент подключился: {addr}")
+        try:
+            if tls_ctx:
+                conn = tls_ctx.wrap_socket(conn, server_side=True)
+        except (ssl.SSLError, OSError) as e:
+            # в TLS-режиме сюда попадают чужие/битые клиенты — это норма
+            print(f"[operator] TLS-рукопожатие с {addr} не удалось: {e}")
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        print(f"[operator] агент подключился: {addr}"
+              + (f" (TLS {conn.version()})" if tls_ctx else ""))
 
         # ── сессия с текущим сокетом ──
         while True:
@@ -144,6 +178,14 @@ def main():
                 return
             if not cmd:
                 continue
+            if cmd == "!drop":
+                # операторская команда: сбросить линк (агент должен переподключиться)
+                print("[operator] линк сброшен — жду переподключения агента")
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                break
             try:
                 is_exit = run_command(conn, cmd)
             except (ConnectionError, OSError) as e:
