@@ -1,0 +1,50 @@
+name: verify
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build agent (MSYS2 gcc)
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -Wall lab-agent.c -o lab-agent.exe -lws2_32 -lsecur32 -ladvapi32 -lcrypt32
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate self-signed certificate
+        shell: bash
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout lab-key.pem -out lab-cert.pem \
+            -days 3650 -nodes -subj "/CN=lab-agent" \
+            -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+
+      - name: Run e2e (plain + tls + wrongpin)
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache-lab
+        run: |
+          python test_e2e.py
+
+      - name: py_compile
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache-lab
+        run: |
+          python -m py_compile listener.py test_e2e.py build.py verify.py

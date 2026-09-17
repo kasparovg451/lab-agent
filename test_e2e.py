@@ -258,18 +258,19 @@ def run_suite(name, port, tls, pin):
             print(f"[{name}] T6 внук        -> exit={code} END за {dt:.2f}с")
         scenario(6, "no grandchild hold", t6)
 
-        # T7: heartbeat ВО ВРЕМЯ долгой команды (в простое listener блокирован
-        # на input() и пинги не читает — задокументированное ограничение v2).
-        # Пинги считаем счётчиком в pump: probe_cmd поглощает буфер вместе
-        # с [ping]-строками, дельта по буферу всегда нулевая (урок: измеряй
-        # в точке приёма, не в потребляемом буфере).
+        # T7: heartbeat ВО ВРЕМЯ долгой команды. v2.1: reader читает всегда,
+        # RTT копится в op.rtt; печатной строки больше нет — факт heartbeat
+        # проверяем операторской командой !stat (n>=1, median/max печатается).
         def t7():
-            print(f"[{name}] T7 heartbeat   -> долгая команда ~8с, счётчик [ping] в pump")
-            n_before = ping_count[0]
+            print(f"[{name}] T7 heartbeat   -> долгая команда ~8с, потом !stat")
             code = probe_cmd(lis, buf, "ping -n 8 127.0.0.1 > nul", "", timeout=30)
-            got = ping_count[0] - n_before
-            check("T7 heartbeat", got >= 1 and code == "0")
-            print(f"[{name}] T7 heartbeat   -> [ping] во время команды = {got}, exit={code}")
+            assert code == "0", f"долгая команда упала: exit={code}"
+            op(lis, "!stat")
+            mst = wait_stdout(buf, r"\[rtt\] n=(\d+) median=([0-9.]+)ms max=([0-9.]+)ms", 10)
+            assert mst, "не дождались [rtt] от !stat"
+            n = int(mst.group(1))
+            check("T7 heartbeat", n >= 1)
+            print(f"[{name}] T7 heartbeat   -> RTT n={n} median={mst.group(2)}ms max={mst.group(3)}ms")
         scenario(7, "heartbeat", t7)
 
         # T8: reconnect через операторскую !drop
