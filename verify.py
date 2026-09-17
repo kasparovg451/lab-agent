@@ -9,9 +9,14 @@
 CI гоняет её же (.github/workflows/verify.yml).
 """
 import os
+import io
 import subprocess
 import sys
 import tempfile
+
+# CI-консоли (cp1252) кириллица не по зубам: форсируем UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(HERE, "lab-agent.exe")

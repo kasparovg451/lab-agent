@@ -19,6 +19,7 @@ listener'а. Крипто не мокается.
 Финал: [RESULT] n/m; exit 0/1.
 """
 import hashlib
+import io
 import os
 import re
 import socket
@@ -27,6 +28,10 @@ import struct
 import subprocess
 import sys
 import time
+
+# CI-консоли (cp1252) кириллица не по зубам: форсируем UTF-8 на stdout/stderr
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE = os.path.join(HERE, "lab-agent.exe")
