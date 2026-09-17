@@ -30,6 +30,8 @@ jobs:
 
       - name: Generate self-signed certificate
         shell: bash
+        env:
+          MSYS_NO_PATHCONV: 1   # иначе Git-Bash превратит /CN=... в C:/Program Files/Git/CN=...
         run: |
           openssl req -x509 -newkey rsa:2048 -keyout lab-key.pem -out lab-cert.pem \
             -days 3650 -nodes -subj "/CN=lab-agent" \
