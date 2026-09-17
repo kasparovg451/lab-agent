@@ -8,6 +8,9 @@ import os
 import subprocess
 import sys
 
+# gcc-предупреждения/пути могут содержать не-cp1252 символы (CI)
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GCC = "C:/msys64/mingw64/bin/gcc.exe"
 env = os.environ.copy()

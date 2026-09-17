@@ -25,6 +25,11 @@ import sys
 import threading
 import time
 
+# stdout может быть пайпом с cp1252-локалью (CI): кириллица умирает на первом
+# print. Форсируем UTF-8, иначе listener падает ДО bind и агент ловит 10061.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 HOST = "127.0.0.1"
 PORT = 4444
 
